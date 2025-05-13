@@ -1,0 +1,32 @@
+# Archivos y carpetas a ignorar por git
+*.pt
+*.pth
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.mp4
+*.avi
+*.mov
+*.mkv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.ipynb_checkpoints/
+detections_output/
+# Archivos temporales de sistema
+.DS_Store
+Thumbs.db
+# Archivos de logs
+*.log
+# Archivos de entorno
+.env
+.venv/
+venv/
+# Archivos de VSCode
+.vscode/
