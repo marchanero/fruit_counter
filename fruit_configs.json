@@ -1,0 +1,92 @@
+{
+  "apple_red": {
+    "hsv_ranges": {
+      "lower": [0, 70, 50],
+      "upper": [10, 255, 255]
+    },
+    "min_area": 300,
+    "confidence_threshold": 0.45,
+    "detector_weights": "yolov8n.pt"
+  },
+  "apple_green": {
+    "hsv_ranges": {
+      "lower": [35, 40, 40],
+      "upper": [90, 255, 255]
+    },
+    "min_area": 300,
+    "confidence_threshold": 0.45,
+    "detector_weights": "yolov8n.pt"
+  },
+  "orange": {
+    "hsv_ranges": {
+      "lower": [10, 100, 100],
+      "upper": [25, 255, 255]
+    },
+    "min_area": 350,
+    "confidence_threshold": 0.5,
+    "detector_weights": "yolov8n.pt"
+  },
+  "grape": {
+    "hsv_ranges": {
+      "lower": [100, 30, 30],
+      "upper": [155, 255, 255]
+    },
+    "min_area": 100,
+    "confidence_threshold": 0.6,
+    "detector_weights": "yolov8n.pt"
+  },
+  "banana": {
+    "hsv_ranges": {
+      "lower": [20, 100, 100],
+      "upper": [35, 255, 255]
+    },
+    "min_area": 400,
+    "confidence_threshold": 0.5,
+    "detector_weights": "yolov8n.pt"
+  },
+  "strawberry": {
+    "hsv_ranges": {
+      "lower": [0, 100, 100],
+      "upper": [10, 255, 255]
+    },
+    "min_area": 200,
+    "confidence_threshold": 0.55,
+    "detector_weights": "yolov8n.pt"
+  },
+  "peach": {
+    "hsv_ranges": {
+      "lower": [10, 80, 80],
+      "upper": [20, 255, 255]
+    },
+    "min_area": 350,
+    "confidence_threshold": 0.5,
+    "detector_weights": "yolov8n.pt"
+  },
+  "lemon": {
+    "hsv_ranges": {
+      "lower": [20, 100, 100],
+      "upper": [35, 255, 255]
+    },
+    "min_area": 250,
+    "confidence_threshold": 0.5,
+    "detector_weights": "yolov8n.pt"
+  },
+  "avocado": {
+    "hsv_ranges": {
+      "lower": [35, 30, 30],
+      "upper": [90, 255, 255]
+    },
+    "min_area": 450,
+    "confidence_threshold": 0.5,
+    "detector_weights": "yolov8n.pt"
+  },
+  "tomato": {
+    "hsv_ranges": {
+      "lower": [0, 70, 70],
+      "upper": [10, 255, 255]
+    },
+    "min_area": 300,
+    "confidence_threshold": 0.5,
+    "detector_weights": "yolov8n.pt"
+  }
+}
