@@ -16,6 +16,8 @@ import json
 import pandas as pd
 from tqdm import tqdm
 from skimage.feature import peak_local_max
+from skimage.segmentation import morphological_geodesic_active_contour, inverse_gaussian_gradient
+from sklearn.cluster import KMeans
 from scipy import ndimage as ndi
 
 # --- Configuración global ---
@@ -29,6 +31,17 @@ CONFIG = {
     'output_format': 'json',  # o 'csv'
     'output_path': 'detections_output',
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+}
+
+# --- Estrategias avanzadas activables ---
+CONFIG_ADVANCED = {
+    'clahe': True,                # Aumento de contraste adaptativo
+    'hsv_clustering': True,       # Clusterización de color en HSV
+    'active_contours': True,      # Refinamiento de máscaras con active contours
+    'watershed_peaks': True,      # Clusterización de picos en distance transform
+    'hough_circles': True,        # Detección de círculos por Hough Transform
+    'edge_detection': True,       # Detección adaptativa de bordes
+    'multi_scale': True           # Enfoque multi-escala para clusters complejos
 }
 
 # --- 1. Carga de modelos ---
@@ -78,40 +91,108 @@ def is_suspect_box(bbox, image_shape, config):
     # Otras heurísticas pueden añadirse aquí
     return False
 
-def segment_and_split(predictor, image, bbox, config):
-    x1, y1, x2, y2 = bbox
-    crop = image[y1:y2, x1:x2]
-    predictor.set_image(crop)
-    # SAM2: segmentación automática de instancias
-    masks, scores, _ = predictor.predict(
-        multimask_output=True
-    )
-    # Postprocesado morfológico para separar instancias solapadas
-    separated_masks = []
-    for mask in masks:
-        separated = split_mask_morphology(mask, config)
-        separated_masks.extend(separated)
-    # Ajustar coordenadas al sistema global
-    global_masks = [offset_mask(m, x1, y1, image.shape) for m in separated_masks]
-    return global_masks
+def preprocess_image(image, config_adv):
+    img = image.copy()
+    if config_adv.get('clahe', False):
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl,a,b))
+        img = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    return img
 
-# --- Watershed más agresivo + clusterización de picos ---
+def hsv_clustering_mask(crop, n_clusters=2):
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    pixels = hsv.reshape(-1, 3)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=5, random_state=0).fit(pixels)
+    labels = kmeans.labels_.reshape(hsv.shape[:2])
+    # Asumimos que la fruta es el cluster más grande
+    unique, counts = np.unique(labels, return_counts=True)
+    fruit_label = unique[np.argmax(counts)]
+    mask = (labels == fruit_label).astype(np.uint8)
+    return mask
+
+def refine_mask_active_contour(mask, crop):
+    # Refinar bordes con active contours (Morphological Snakes)
+    gimg = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gimg = gimg.astype(float) / 255.0
+    gimg = inverse_gaussian_gradient(gimg)
+    init_ls = np.zeros_like(mask, dtype=float)
+    init_ls[mask > 0] = 1.0
+    snake = morphological_geodesic_active_contour(gimg, 40, init_ls, smoothing=2, balloon=1, threshold=0.3)
+    return (snake > 0.5).astype(np.uint8)
+
 def split_mask_with_peaks(mask, config):
-    # Calcula el distance transform
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    # Detecta picos locales (centros de frutas)
-    coordinates = peak_local_max(dist, min_distance=10, threshold_abs=0.2*dist.max(), labels=mask)
+    # Calcula el distance transform con mayor precisión
+    mask_8bit = (mask * 255).astype(np.uint8)
+    # Aplica un suave suavizado para mejorar el distance transform
+    mask_smooth = cv2.GaussianBlur(mask_8bit, (3, 3), 0)
+    dist = cv2.distanceTransform(mask_smooth, cv2.DIST_L2, 5)
+    
+    # Normaliza distance transform para mejor visualización y detección
+    dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
+    
+    # Detecta picos locales con parámetros adaptativos según el tamaño del cluster
+    mask_area = np.count_nonzero(mask)
+    img_area = mask.shape[0] * mask.shape[1]
+    ratio = mask_area / img_area
+    
+    # Parámetros adaptativos basados en densidad del cluster
+    if ratio > 0.5:  # Cluster muy grande
+        min_distance = max(5, int(np.sqrt(mask_area) / 15))
+        threshold_rel = 0.3
+    else:  # Cluster normal o pequeño
+        min_distance = max(8, int(np.sqrt(mask_area) / 10))
+        threshold_rel = 0.5
+    
+    # Detecta más picos en clusters densos
+    coordinates = peak_local_max(
+        dist_norm, 
+        min_distance=min_distance,
+        threshold_rel=threshold_rel,  # Umbral relativo para detectar picos
+        exclude_border=False,
+        indices=True,
+        labels=mask
+    )
+    
+    # Si solo encontramos 0 o 1 pico en un área grande, bajamos el umbral para detectar más
+    if len(coordinates) <= 1 and mask_area > 2 * config['min_instance_area']:
+        coordinates = peak_local_max(
+            dist_norm, 
+            min_distance=max(3, int(min_distance/2)),
+            threshold_rel=0.25,
+            exclude_border=False,
+            indices=True,
+            labels=mask
+        )
+    
     # Crea marcadores para watershed
     markers = np.zeros_like(mask, dtype=np.int32)
     for i, (y, x) in enumerate(coordinates, 1):
         markers[y, x] = i
+    
+    # Si no hay picos detectados, devuelve la máscara original como una región
+    if len(coordinates) == 0:
+        return [mask]
+    
+    # Aplica watershed con gradiente óptimo
+    # Convertir a color y aplicar un filtro de gradiente para mejorar los bordes
+    mask_color = cv2.cvtColor(mask_8bit, cv2.COLOR_GRAY2BGR)
+    
     # Aplica watershed
-    labels = cv2.watershed(cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR), markers.copy())
+    labels = cv2.watershed(mask_color, markers.copy())
+    
+    # Procesa regiones resultantes
     separated = []
     for label in range(1, np.max(labels)+1):
         region = (labels == label).astype(np.uint8)
         if cv2.countNonZero(region) > config['min_instance_area']:
+            # Aplica un cierre morfológico para suavizar bordes
+            kernel = np.ones((3,3), np.uint8)
+            region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, kernel)
             separated.append(region)
+    
     return separated
 
 def split_mask_morphology(mask, config):
@@ -142,6 +223,186 @@ def offset_mask(mask, x_offset, y_offset, image_shape):
     full_mask = np.zeros(image_shape[:2], dtype=np.uint8)
     full_mask[y_offset:y_offset+h, x_offset:x_offset+w] = mask
     return full_mask
+
+def detect_hough_circles(crop, mask=None, min_radius=10, max_radius=None):
+    """
+    Utiliza la transformada circular de Hough para detectar círculos en zonas con frutas.
+    Funciona mejor para frutas con forma redondeada.
+    
+    Args:
+        crop: Imagen recortada donde buscar círculos
+        mask: Máscara opcional para restringir la búsqueda
+        min_radius: Radio mínimo de círculos a buscar
+        max_radius: Radio máximo de círculos a buscar
+    
+    Returns:
+        Lista de máscaras para cada círculo detectado
+    """
+    # Si no se especifica radio máximo, calcular basado en tamaño de imagen
+    if max_radius is None:
+        max_radius = min(crop.shape[0], crop.shape[1]) // 3
+    
+    # Preparar la imagen
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    
+    # Si hay máscara, aplicarla
+    if mask is not None:
+        gray = cv2.bitwise_and(gray, gray, mask=mask)
+    
+    # Aplicar un suavizado para reducir ruido
+    gray = cv2.medianBlur(gray, 5)
+    
+    # Parámetros para HoughCircles - ajustados para ser más sensibles en clusters
+    dp = 1.2  # Resolución inversa del acumulador
+    minDist = min_radius * 1.5  # Distancia mínima entre círculos
+    param1 = 50  # Umbral superior para el detector de bordes Canny interno
+    param2 = 30  # Umbral del acumulador (menor = más círculos falsos positivos)
+    
+    # Detectar círculos
+    circles = cv2.HoughCircles(
+        gray, 
+        cv2.HOUGH_GRADIENT, 
+        dp=dp, 
+        minDist=minDist,
+        param1=param1, 
+        param2=param2, 
+        minRadius=min_radius, 
+        maxRadius=max_radius
+    )
+    
+    # Crear máscaras para cada círculo detectado
+    masks = []
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        
+        for circle in circles[0, :]:
+            center_x, center_y, radius = circle
+            
+            # Crear máscara para este círculo
+            circle_mask = np.zeros_like(gray, dtype=np.uint8)
+            cv2.circle(circle_mask, (center_x, center_y), radius, 255, -1)
+            
+            # Si hay máscara original, intersectarla con la del círculo
+            if mask is not None:
+                circle_mask = cv2.bitwise_and(circle_mask, mask)
+            
+            masks.append(circle_mask)
+    
+    return masks
+
+def detect_edge_adaptive(crop, mask=None):
+    """
+    Detecta bordes de forma adaptativa para separar frutas en clusters densos
+    
+    Args:
+        crop: Imagen recortada donde buscar bordes
+        mask: Máscara opcional para restringir la búsqueda
+    
+    Returns:
+        Imagen con bordes detectados
+    """
+    # Convertir a escala de grises
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    
+    # Si hay máscara, aplicarla
+    if mask is not None:
+        gray = cv2.bitwise_and(gray, gray, mask=mask)
+    
+    # Aplicar un suavizado para reducir ruido
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Detección adaptativa de bordes (Canny con umbral automático)
+    v = np.median(blur)
+    sigma = 0.33
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+    
+    # Aplicar Canny detector
+    edges = cv2.Canny(blur, lower, upper)
+    
+    # Dilatar bordes para hacerlos más visibles
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    return edges
+
+def analyze_multi_scale(crop, mask=None):
+    """
+    Analiza una imagen a múltiples escalas para detectar mejor las frutas en clusters
+    
+    Args:
+        crop: Imagen recortada a analizar
+        mask: Máscara opcional para restringir el análisis
+    
+    Returns:
+        Lista de máscaras de frutas detectadas
+    """
+    # Escalas a analizar (factores de escalado)
+    scales = [0.5, 1.0, 1.5]
+    
+    all_masks = []
+    height, width = crop.shape[:2]
+    
+    for scale in scales:
+        # Redimensionar imagen
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        # Evitar tamaños muy pequeños
+        if new_width < 20 or new_height < 20:
+            continue
+            
+        resized = cv2.resize(crop, (new_width, new_height))
+        
+        # Si hay máscara, escalarla también
+        resized_mask = None
+        if mask is not None:
+            resized_mask = cv2.resize(mask, (new_width, new_height), 
+                                    interpolation=cv2.INTER_NEAREST)
+        
+        # Aplicar detección de círculos en esta escala
+        circles_masks = detect_hough_circles(
+            resized, 
+            resized_mask,
+            min_radius=max(5, int(10 * scale)),
+            max_radius=max(20, int(50 * scale))
+        )
+        
+        # Escalar las máscaras de vuelta al tamaño original
+        for cmask in circles_masks:
+            orig_mask = cv2.resize(cmask, (width, height), 
+                                interpolation=cv2.INTER_NEAREST)
+            all_masks.append(orig_mask)
+    
+    return all_masks
+
+def segment_and_split(predictor, image, bbox, config):
+    x1, y1, x2, y2 = bbox
+    crop = image[y1:y2, x1:x2]
+    crop_proc = preprocess_image(crop, CONFIG_ADVANCED)
+    if CONFIG_ADVANCED.get('hsv_clustering', False):
+        mask = hsv_clustering_mask(crop_proc)
+        masks = [mask]
+    else:
+        predictor.set_image(crop_proc)
+        masks, scores, _ = predictor.predict(multimask_output=True)
+    separated_masks = []
+    for mask in masks:
+        mask_bin = (mask > 0.5).astype(np.uint8)
+        # Active contours opcional
+        if CONFIG_ADVANCED.get('active_contours', False):
+            try:
+                mask_bin = refine_mask_active_contour(mask_bin, crop_proc)
+            except Exception as e:
+                print(f"[ActiveContours] Error: {e}")
+        # Watershed+peaks opcional
+        if CONFIG_ADVANCED.get('watershed_peaks', True):
+            separated = split_mask_morphology(mask_bin, config)
+        else:
+            separated = [mask_bin]
+        separated_masks.extend(separated)
+    global_masks = [offset_mask(m, x1, y1, image.shape) for m in separated_masks]
+    return global_masks
 
 def filter_duplicates(masks, iou_threshold=0.5):
     # Elimina máscaras duplicadas usando IoU
